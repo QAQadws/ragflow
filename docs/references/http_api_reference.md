@@ -2086,8 +2086,11 @@ curl --request DELETE \
   The IDs of the chunks to delete.
   - If omitted, or set to `null` or an empty array, no chunks are deleted.
   - If an array of IDs is provided, only the chunks matching those IDs are deleted.
+  - Duplicate IDs are deleted once. A successful response includes `data.success_count` and duplicate-ID messages in `data.errors`.
 - `"delete_all"`: (*Body parameter*), `boolean`
   Whether to delete all chunks of the specified document when `"chunk_ids"` is omitted, or set to `null` or an empty array. Defaults to `false`.
+
+An omitted request body or `{}` is a successful no-op. Deletion is restricted to the specified dataset and document and excludes compiled chunks. If fewer chunks are deleted than the number of unique requested IDs, the response has code `102`; any matching chunks have still been deleted and their counts updated.
 
 #### Response
 

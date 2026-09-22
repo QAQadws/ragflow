@@ -530,14 +530,15 @@ func (s *ChunkService) resolveRESTChunkDocument(ctx context.Context, datasetID, 
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to get user tenants: %w", err)
 	}
-	hasAccess := false
+	tenantIDs := make([]string, 0, len(tenants))
 	for _, tenant := range tenants {
-		if tenant.TenantID == kb.TenantID {
-			hasAccess = true
-			break
-		}
+		tenantIDs = append(tenantIDs, tenant.TenantID)
 	}
-	if !hasAccess {
+	accessibleIDs, err := s.kbDAO.GetAccessibleIDs(ctx, dao.DB, tenantIDs, userID, []string{datasetID})
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to check dataset access: %w", err)
+	}
+	if len(accessibleIDs) == 0 {
 		return nil, "", chunkReadError{message: fmt.Sprintf("You don't own the dataset %s.", datasetID)}
 	}
 
@@ -1300,55 +1301,34 @@ func (s *ChunkService) RemoveChunks(ctx context.Context, req *service.RemoveChun
 		return 0, fmt.Errorf("doc_id is required")
 	}
 
-	// Get user's tenants
-	tenants, err := s.userTenantDAO.GetByUserID(ctx, dao.DB, userID)
+	doc, targetTenantID, err := s.resolveRESTChunkDocument(ctx, req.DatasetID, req.DocID, userID)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get user tenants: %w", err)
-	}
-	if len(tenants) == 0 {
-		return 0, fmt.Errorf("user has no accessible tenants")
-	}
-
-	// Verify document exists and belongs to a dataset (do this first to get doc.KbID)
-	docDAO := dao.NewDocumentDAO()
-	doc, err := docDAO.GetByID(ctx, dao.DB, req.DocID)
-	if err != nil || doc == nil {
-		return 0, fmt.Errorf("document not found")
-	}
-
-	// Find the tenant that owns this document
-	var targetTenantID string
-	for _, tenant := range tenants {
-		kb, err := s.kbDAO.GetByIDAndTenantID(ctx, dao.DB, doc.KbID, tenant.TenantID)
-		if err == nil && kb != nil {
-			targetTenantID = tenant.TenantID
-			break
-		}
-	}
-	if targetTenantID == "" {
-		return 0, fmt.Errorf("user does not have access to this document")
+		return 0, err
 	}
 
 	indexName := fmt.Sprintf("ragflow_%s", targetTenantID)
 
 	// Build condition
-	condition := make(map[string]interface{})
+	condition := map[string]interface{}{
+		"kb_id":    req.DatasetID,
+		"doc_id":   req.DocID,
+		"must_not": map[string]interface{}{"exists": "compile_kwd"},
+	}
+	chunkIDs, _ := service.CheckDuplicateIDs(req.ChunkIDs, "chunk")
 	switch {
 	case len(req.ChunkIDs) > 0 && req.DeleteAll:
 		return 0, fmt.Errorf("chunk_ids and delete_all are mutually exclusive")
 	case len(req.ChunkIDs) > 0:
 		// Delete specific chunks - convert []string to []interface{} for buildFilterFromCondition
-		chunkIDsIf := make([]interface{}, len(req.ChunkIDs))
-		for i, id := range req.ChunkIDs {
+		chunkIDsIf := make([]interface{}, len(chunkIDs))
+		for i, id := range chunkIDs {
 			chunkIDsIf[i] = id
 		}
 		condition["id"] = chunkIDsIf
-		condition["doc_id"] = req.DocID
 	case req.DeleteAll:
-		// Delete all chunks for this document
-		condition["doc_id"] = req.DocID
+		// The document condition selects all non-compiled chunks.
 	default:
-		return 0, fmt.Errorf("either chunk_ids or delete_all must be provided")
+		return 0, nil
 	}
 
 	deletedCount, err := s.docEngine.DeleteChunks(ctx, condition, indexName, doc.KbID)
@@ -1362,9 +1342,19 @@ func (s *ChunkService) RemoveChunks(ctx context.Context, req *service.RemoveChun
 		}
 		s.markWikiDirty(ctx, targetTenantID, doc.KbID, req.DocID, req.ChunkIDs)
 	}
+	if !req.DeleteAll && deletedCount != int64(len(chunkIDs)) {
+		return deletedCount, removeChunksError{message: fmt.Sprintf("rm_chunk deleted chunks %d, expect %d", deletedCount, len(chunkIDs))}
+	}
 
 	return deletedCount, nil
 }
+
+type removeChunksError struct {
+	message string
+}
+
+func (e removeChunksError) Error() string          { return e.message }
+func (e removeChunksError) Code() common.ErrorCode { return common.CodeDataError }
 
 func (s *ChunkService) AddChunk(ctx context.Context, req *service.AddChunkRequest, userID string) (*service.AddChunkResponse, error) {
 	if s.docEngine == nil {

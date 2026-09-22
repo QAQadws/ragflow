@@ -26,6 +26,7 @@ type mockChunkSvc struct {
 	listFn          func(ctx context.Context, req *service.ListChunksRequest, userID string) (*service.ListChunksResponse, error)
 	switchChunksFn  func(ctx context.Context, userID, datasetID, documentID string, availableInt int, chunkIDs []string) error
 	updateChunkFn   func(ctx context.Context, req *service.UpdateChunkRequest, userID string) error
+	removeChunksFn  func(ctx context.Context, req *service.RemoveChunksRequest, userID string) (int64, error)
 	stopParsingFn   func(ctx context.Context, userID, datasetID string, req service.StopParsingRequest) (*service.StopParsingResponse, common.ErrorCode, error)
 }
 
@@ -75,8 +76,59 @@ func (m *mockChunkSvc) UpdateChunk(ctx context.Context, req *service.UpdateChunk
 	}
 	panic("not implemented")
 }
-func (m *mockChunkSvc) RemoveChunks(context.Context, *service.RemoveChunksRequest, string) (int64, error) {
+func (m *mockChunkSvc) RemoveChunks(ctx context.Context, req *service.RemoveChunksRequest, userID string) (int64, error) {
+	if m.removeChunksFn != nil {
+		return m.removeChunksFn(ctx, req, userID)
+	}
 	panic("not implemented")
+}
+
+func TestChunkHandlerRemoveChunksContract(t *testing.T) {
+	for _, tc := range []struct {
+		name, body   string
+		err          error
+		status, code int
+	}{
+		{name: "no body", status: 200},
+		{name: "empty object", body: `{}`, status: 200},
+		{name: "null ids", body: `{"chunk_ids":null}`, status: 200},
+		{name: "frontend ids", body: `{"chunk_ids":["c1"]}`, status: 200},
+		{name: "duplicates", body: `{"chunk_ids":["c1","c1"]}`, status: 200},
+		{name: "malformed", body: `{`, status: 400, code: 400},
+		{name: "missing", body: `{}`, err: codedTestError{common.CodeDataError, "missing"}, status: 200, code: 102},
+		{name: "engine failure", body: `{}`, err: errors.New("engine failed"), status: 500, code: 500},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			mock := &mockChunkSvc{removeChunksFn: func(_ context.Context, req *service.RemoveChunksRequest, userID string) (int64, error) {
+				called = true
+				if req.DatasetID != "kb-1" || req.DocID != "doc-1" || userID != "user-1" {
+					t.Fatalf("unexpected scope: %#v, %s", req, userID)
+				}
+				return 1, tc.err
+			}}
+			r, h := setupChunkHandlerWithUser("user-1", mock)
+			r.DELETE("/datasets/:dataset_id/documents/:document_id/chunks", h.RemoveChunks)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/datasets/kb-1/documents/doc-1/chunks", strings.NewReader(tc.body)))
+			var body map[string]interface{}
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if w.Code != tc.status || body["code"] != float64(tc.code) {
+				t.Fatalf("response = %d %s", w.Code, w.Body.String())
+			}
+			if tc.name == "malformed" && called {
+				t.Fatal("malformed request reached service")
+			}
+			if tc.name == "duplicates" {
+				data := body["data"].(map[string]interface{})
+				if data["success_count"] != float64(1) || !reflect.DeepEqual(data["errors"], []interface{}{"Duplicate chunk ids: c1"}) {
+					t.Fatalf("data = %#v", data)
+				}
+			}
+		})
+	}
 }
 func (m *mockChunkSvc) StopParsing(ctx context.Context, userID, datasetID string, req service.StopParsingRequest) (*service.StopParsingResponse, common.ErrorCode, error) {
 	if m.stopParsingFn != nil {

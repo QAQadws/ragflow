@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"ragflow/internal/common"
 	"strconv"
@@ -654,25 +655,35 @@ func (h *ChunkHandler) RemoveChunks(c *gin.Context) {
 	}
 
 	var req service.RemoveChunksRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
 		common.ResponseWithHttpCodeData(c, http.StatusBadRequest, 400, nil, err.Error())
 		return
 	}
 
 	req.DocID = docID
-
-	if req.DocID == "" {
-		common.ResponseWithHttpCodeData(c, http.StatusBadRequest, 400, nil, "doc_id is required")
+	req.DatasetID = c.Param("dataset_id")
+	if req.DatasetID == "" {
+		common.ResponseWithHttpCodeData(c, http.StatusBadRequest, 400, nil, "dataset_id is required")
 		return
 	}
 
 	ctx := c.Request.Context()
 	deletedCount, err := h.chunkService.RemoveChunks(ctx, &req, user.ID)
 	if err != nil {
+		var coded service.ErrorCoder
+		if errors.As(err, &coded) {
+			common.ResponseWithHttpCodeData(c, http.StatusOK, coded.Code(), nil, err.Error())
+			return
+		}
 		common.ResponseWithHttpCodeData(c, http.StatusInternalServerError, 500, nil, err.Error())
 		return
 	}
 
+	_, duplicates := service.CheckDuplicateIDs(req.ChunkIDs, "chunk")
+	if len(duplicates) > 0 {
+		common.SuccessWithData(c, map[string]interface{}{"success_count": deletedCount, "errors": duplicates}, "success")
+		return
+	}
 	common.SuccessWithData(c, deletedCount, "success")
 }
 
