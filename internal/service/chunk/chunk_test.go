@@ -439,6 +439,89 @@ func TestListBuildsMatchTextExprForKeywords(t *testing.T) {
 	}
 }
 
+func TestChunkServiceListAndGetExactChunkContract(t *testing.T) {
+	db := setupChunkTestDB(t)
+	pushChunkTestDB(t, db)
+
+	const (
+		userID     = "user-1"
+		tenantID   = "tenant-1"
+		datasetID  = "kb-1"
+		documentID = "doc-1"
+		chunkID    = "chunk-1"
+	)
+	insertChunkTestUserTenant(t, userID, tenantID)
+	insertChunkTestKB(t, datasetID, tenantID)
+	insertChunkTestDoc(t, documentID, datasetID)
+
+	engine := &listChunksSearchEngine{
+		getChunkResult: map[string]interface{}{
+			"id":                  chunkID,
+			"doc_id":              documentID,
+			"content_with_weight": "exact content",
+		},
+	}
+	svc := &ChunkService{
+		docEngine:     engine,
+		kbDAO:         dao.NewKnowledgebaseDAO(),
+		userTenantDAO: dao.NewUserTenantDAO(),
+		documentDAO:   dao.NewDocumentDAO(),
+	}
+
+	resp, err := svc.List(t.Context(), &service.ListChunksRequest{
+		DatasetID: datasetID,
+		DocID:     documentID,
+		ChunkID:   chunkID,
+		ChunkIDs:  []string{"ignored"},
+	}, userID)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if resp.Total != 1 || len(resp.Chunks) != 1 || resp.Chunks[0]["id"] != chunkID {
+		t.Fatalf("List() response = %#v", resp)
+	}
+	if engine.searchReq != nil {
+		t.Fatal("exact id lookup should not call Search")
+	}
+	if engine.getChunkIndex != "ragflow_"+tenantID || engine.getChunkID != chunkID || !reflect.DeepEqual(engine.getChunkDatasets, []string{datasetID}) {
+		t.Fatalf("GetChunk scope = %q/%q/%#v", engine.getChunkIndex, engine.getChunkID, engine.getChunkDatasets)
+	}
+
+	getResp, err := svc.Get(t.Context(), &service.GetChunkRequest{
+		DatasetID:  datasetID,
+		DocumentID: documentID,
+		ChunkID:    chunkID,
+	}, userID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if getResp.Chunk["id"] != chunkID {
+		t.Fatalf("Get() response = %#v", getResp)
+	}
+
+	for name, result := range map[string]interface{}{
+		"missing":         nil,
+		"other document":  map[string]interface{}{"id": chunkID, "doc_id": "doc-2"},
+		"compiled result": map[string]interface{}{"id": chunkID, "doc_id": documentID, "compile_kwd": "compiled"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			engine.getChunkResult = result
+			_, err := svc.List(t.Context(), &service.ListChunksRequest{DatasetID: datasetID, DocID: documentID, ChunkID: chunkID}, userID)
+			var coded service.ErrorCoder
+			if !errors.As(err, &coded) || coded.Code() != common.CodeDataError || err.Error() != "Chunk not found: kb-1/chunk-1" {
+				t.Fatalf("List() error = %v", err)
+			}
+		})
+	}
+
+	engine.getChunkResult = nil
+	_, err = svc.Get(t.Context(), &service.GetChunkRequest{DatasetID: datasetID, DocumentID: documentID, ChunkID: chunkID}, userID)
+	var coded service.ErrorCoder
+	if !errors.As(err, &coded) || coded.Code() != common.CodeDataError || err.Error() != "Chunk not found!" {
+		t.Fatalf("Get() error = %v", err)
+	}
+}
+
 func TestUpdateChunkRejectsChunkFromAnotherDocument(t *testing.T) {
 	db := setupChunkTestDB(t)
 	pushChunkTestDB(t, db)
@@ -1272,7 +1355,12 @@ func (e *addChunkTestEngine) InsertChunks(_ context.Context, chunks []map[string
 
 type listChunksSearchEngine struct {
 	parseTestDocEngine
-	searchReq *types.SearchRequest
+	searchReq        *types.SearchRequest
+	getChunkResult   interface{}
+	getChunkErr      error
+	getChunkIndex    string
+	getChunkID       string
+	getChunkDatasets []string
 }
 
 func (e *listChunksSearchEngine) Search(_ context.Context, req *types.SearchRequest) (*types.SearchResult, error) {
@@ -1288,6 +1376,13 @@ func (e *listChunksSearchEngine) Search(_ context.Context, req *types.SearchRequ
 		},
 		Total: 1,
 	}, nil
+}
+
+func (e *listChunksSearchEngine) GetChunk(_ context.Context, indexName, chunkID string, datasetIDs []string) (interface{}, error) {
+	e.getChunkIndex = indexName
+	e.getChunkID = chunkID
+	e.getChunkDatasets = append([]string(nil), datasetIDs...)
+	return e.getChunkResult, e.getChunkErr
 }
 
 type updateChunkTestEngine struct {

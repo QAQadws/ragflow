@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -517,93 +518,134 @@ func hydrateChunkVectors(ctx context.Context, engine engine.DocEngine, chunks []
 	}
 }
 
-// Get retrieves a chunk by ID
+func (s *ChunkService) resolveRESTChunkDocument(ctx context.Context, datasetID, documentID, userID string) (*entity.Document, string, error) {
+	kb, err := s.kbDAO.GetByID(ctx, dao.DB, datasetID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, "", chunkReadError{message: fmt.Sprintf("You don't own the dataset %s.", datasetID)}
+		}
+		return nil, "", fmt.Errorf("failed to get dataset: %w", err)
+	}
+	tenants, err := s.userTenantDAO.GetByUserID(ctx, dao.DB, userID)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to get user tenants: %w", err)
+	}
+	hasAccess := false
+	for _, tenant := range tenants {
+		if tenant.TenantID == kb.TenantID {
+			hasAccess = true
+			break
+		}
+	}
+	if !hasAccess {
+		return nil, "", chunkReadError{message: fmt.Sprintf("You don't own the dataset %s.", datasetID)}
+	}
+
+	documentDAO := s.documentDAO
+	if documentDAO == nil {
+		documentDAO = dao.NewDocumentDAO()
+	}
+	doc, err := documentDAO.GetByDocumentIDAndDatasetID(ctx, dao.DB, documentID, datasetID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, "", chunkReadError{message: fmt.Sprintf("you don't own the document %s", documentID)}
+		}
+		return nil, "", fmt.Errorf("failed to get document: %w", err)
+	}
+
+	return doc, kb.TenantID, nil
+}
+
+func (s *ChunkService) getScopedChunk(ctx context.Context, indexName, datasetID, documentID, chunkID string) (map[string]interface{}, error) {
+	raw, err := s.docEngine.GetChunk(ctx, indexName, chunkID, []string{datasetID})
+	if err != nil {
+		if errors.Is(err, types.ErrDocumentNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if raw == nil {
+		return nil, nil
+	}
+
+	chunk, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid chunk format")
+	}
+	docID, ok := chunk["doc_id"]
+	if !ok {
+		docID, ok = chunk["document_id"]
+	}
+	if !ok || fmt.Sprint(docID) != documentID {
+		return nil, nil
+	}
+	if compile, ok := chunk["compile_kwd"]; ok && !utility.IsEmpty(compile) {
+		return nil, nil
+	}
+	return chunk, nil
+}
+
+// Get retrieves a chunk by ID.
 func (s *ChunkService) Get(ctx context.Context, req *service.GetChunkRequest, userID string) (*service.GetChunkResponse, error) {
 	if s.docEngine == nil {
 		return nil, fmt.Errorf("doc engine not initialized")
 	}
-
-	if req.ChunkID == "" {
-		return nil, fmt.Errorf("chunk_id is required")
+	if req.DatasetID == "" || req.DocumentID == "" || req.ChunkID == "" {
+		return nil, fmt.Errorf("dataset_id, document_id, and chunk_id are required")
 	}
 
-	// Get user's tenants
-	tenants, err := s.userTenantDAO.GetByUserID(ctx, dao.DB, userID)
+	_, tenantID, err := s.resolveRESTChunkDocument(ctx, req.DatasetID, req.DocumentID, userID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get user tenants: %w", err)
+		return nil, err
 	}
-	if len(tenants) == 0 {
-		return nil, fmt.Errorf("user has no accessible tenants")
+	chunk, err := s.getScopedChunk(ctx, fmt.Sprintf("ragflow_%s", tenantID), req.DatasetID, req.DocumentID, req.ChunkID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get chunk: %w", err)
 	}
-
-	// Try each tenant to find the chunk
-	var chunk map[string]interface{}
-	for _, tenant := range tenants {
-		// Get kbIDs for this tenant
-		kbIDs, err := s.kbDAO.GetKBIDsByTenantID(ctx, dao.DB, tenant.TenantID)
-		if err != nil {
-			continue
-		}
-
-		indexName := fmt.Sprintf("ragflow_%s", tenant.TenantID)
-
-		doc, err := s.docEngine.GetChunk(ctx, indexName, req.ChunkID, kbIDs)
-		if err != nil {
-			continue
-		}
-
-		if doc != nil {
-			chunk, ok := doc.(map[string]interface{})
-			if ok {
-				result := make(map[string]interface{})
-				skipFields := map[string]bool{
-					"id": true, "authors": true, "_score": true, "SCORE": true,
-				}
-				for k, v := range chunk {
-					if skipFields[k] || strings.HasSuffix(k, "_vec") || strings.Contains(k, "_sm_") || strings.HasSuffix(k, "_tks") || strings.HasSuffix(k, "_ltks") {
-						continue
-					}
-					switch k {
-					case "content":
-						result["content_with_weight"] = v
-					case "docnm":
-						result["docnm_kwd"] = v
-					case "important_keywords":
-						utility.SetFieldArray(result, "important_kwd", v)
-					case "questions":
-						utility.SetFieldArray(result, "question_kwd", v)
-					case "entities_kwd", "entity_kwd", "entity_type_kwd", "from_entity_kwd",
-						"name_kwd", "raptor_kwd", "removed_kwd", "source_id", "tag_kwd",
-						"to_entity_kwd", "toc_kwd", "authors_tks", "doc_type_kwd":
-						if utility.IsEmpty(v) {
-							result[k] = []interface{}{}
-						} else {
-							result[k] = v
-						}
-					case "tag_feas":
-						if utility.IsEmpty(v) {
-							result[k] = map[string]interface{}{}
-						} else {
-							result[k] = v
-						}
-					case "create_timestamp_flt", "rank_flt", "weight_flt":
-						if floatVal, ok := utility.ToFloat64(v); ok {
-							result[k] = utility.JSONFloat64(floatVal)
-						}
-					default:
-						result[k] = v
-					}
-				}
-				return &service.GetChunkResponse{Chunk: result}, nil
-			}
-		}
-	}
-
 	if chunk == nil {
-		return nil, fmt.Errorf("chunk not found")
+		return nil, chunkReadError{message: "Chunk not found!"}
 	}
 
-	return &service.GetChunkResponse{Chunk: chunk}, nil
+	result := make(map[string]interface{})
+	skipFields := map[string]bool{
+		"authors": true, "_score": true, "SCORE": true,
+	}
+	for k, v := range chunk {
+		if skipFields[k] || strings.HasSuffix(k, "_vec") || strings.Contains(k, "_sm_") || strings.HasSuffix(k, "_tks") || strings.HasSuffix(k, "_ltks") {
+			continue
+		}
+		switch k {
+		case "content":
+			result["content_with_weight"] = v
+		case "docnm":
+			result["docnm_kwd"] = v
+		case "important_keywords":
+			utility.SetFieldArray(result, "important_kwd", v)
+		case "questions":
+			utility.SetFieldArray(result, "question_kwd", v)
+		case "entities_kwd", "entity_kwd", "entity_type_kwd", "from_entity_kwd",
+			"name_kwd", "raptor_kwd", "removed_kwd", "source_id", "tag_kwd",
+			"to_entity_kwd", "toc_kwd", "authors_tks", "doc_type_kwd":
+			if utility.IsEmpty(v) {
+				result[k] = []interface{}{}
+			} else {
+				result[k] = v
+			}
+		case "tag_feas":
+			if utility.IsEmpty(v) {
+				result[k] = map[string]interface{}{}
+			} else {
+				result[k] = v
+			}
+		case "create_timestamp_flt", "rank_flt", "weight_flt":
+			if floatVal, ok := utility.ToFloat64(v); ok {
+				result[k] = utility.JSONFloat64(floatVal)
+			}
+		default:
+			result[k] = v
+		}
+	}
+	return &service.GetChunkResponse{Chunk: result}, nil
 }
 
 const (
@@ -795,47 +837,49 @@ func (s *ChunkService) List(ctx context.Context, req *service.ListChunksRequest,
 		return nil, fmt.Errorf("doc_id is required")
 	}
 
-	// Get user's tenants
-	tenants, err := s.userTenantDAO.GetByUserID(ctx, dao.DB, userID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get user tenants: %w", err)
-	}
-	if len(tenants) == 0 {
-		return nil, fmt.Errorf("user has no accessible tenants")
-	}
-
-	// Get document to find its tenant
-	docDAO := dao.NewDocumentDAO()
-	doc, err := docDAO.GetByID(ctx, dao.DB, req.DocID)
-	if err != nil || doc == nil {
-		return nil, fmt.Errorf("document not found")
-	}
-	if req.DatasetID != "" && doc.KbID != req.DatasetID {
-		return nil, fmt.Errorf("document not found")
-	}
-
-	// Get knowledge base to find tenant
-	kb, err := s.kbDAO.GetByID(ctx, dao.DB, doc.KbID)
-	if err != nil || kb == nil {
-		return nil, fmt.Errorf("knowledge base not found")
-	}
-
-	// Find which tenant this document belongs to
-	var targetTenantID string
-	for _, tenant := range tenants {
-		if tenant.TenantID == kb.TenantID {
-			targetTenantID = tenant.TenantID
-			break
+	var (
+		doc            *entity.Document
+		targetTenantID string
+		kbIDs          []string
+		err            error
+	)
+	if req.DatasetID != "" {
+		doc, targetTenantID, err = s.resolveRESTChunkDocument(ctx, req.DatasetID, req.DocID, userID)
+		if err != nil {
+			return nil, err
 		}
-	}
-	if targetTenantID == "" {
-		return nil, fmt.Errorf("user does not have access to this document")
-	}
+		kbIDs = []string{req.DatasetID}
+	} else {
+		tenants, tenantErr := s.userTenantDAO.GetByUserID(ctx, dao.DB, userID)
+		if tenantErr != nil {
+			return nil, fmt.Errorf("failed to get user tenants: %w", tenantErr)
+		}
+		if len(tenants) == 0 {
+			return nil, fmt.Errorf("user has no accessible tenants")
+		}
 
-	// Get kbIDs for this tenant
-	kbIDs, err := s.kbDAO.GetKBIDsByTenantID(ctx, dao.DB, targetTenantID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get kb ids: %w", err)
+		docDAO := dao.NewDocumentDAO()
+		doc, err = docDAO.GetByID(ctx, dao.DB, req.DocID)
+		if err != nil || doc == nil {
+			return nil, fmt.Errorf("document not found")
+		}
+		kb, kbErr := s.kbDAO.GetByID(ctx, dao.DB, doc.KbID)
+		if kbErr != nil || kb == nil {
+			return nil, fmt.Errorf("knowledge base not found")
+		}
+		for _, tenant := range tenants {
+			if tenant.TenantID == kb.TenantID {
+				targetTenantID = tenant.TenantID
+				break
+			}
+		}
+		if targetTenantID == "" {
+			return nil, fmt.Errorf("user does not have access to this document")
+		}
+		kbIDs, err = s.kbDAO.GetKBIDsByTenantID(ctx, dao.DB, targetTenantID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get kb ids: %w", err)
+		}
 	}
 
 	indexName := fmt.Sprintf("ragflow_%s", targetTenantID)
@@ -906,10 +950,22 @@ func (s *ChunkService) List(ctx context.Context, req *service.ListChunksRequest,
 		searchReq.Filter["available_int"] = *req.AvailableInt
 	}
 
-	// Execute search through unified engine interface
-	searchResp, err := s.docEngine.Search(ctx, searchReq)
-	if err != nil {
-		return nil, fmt.Errorf("search failed: %w", err)
+	var searchResp *types.SearchResult
+	if req.ChunkID != "" {
+		chunk, getErr := s.getScopedChunk(ctx, indexName, doc.KbID, req.DocID, req.ChunkID)
+		if getErr != nil {
+			return nil, fmt.Errorf("failed to get chunk: %w", getErr)
+		}
+		if chunk == nil {
+			return nil, chunkReadError{message: fmt.Sprintf("Chunk not found: %s/%s", req.DatasetID, req.ChunkID)}
+		}
+		searchResp = &types.SearchResult{Chunks: []map[string]interface{}{chunk}, Total: 1}
+	} else {
+		// Execute search through unified engine interface.
+		searchResp, err = s.docEngine.Search(ctx, searchReq)
+		if err != nil {
+			return nil, fmt.Errorf("search failed: %w", err)
+		}
 	}
 
 	chunks := make([]map[string]interface{}, 0, len(searchResp.Chunks))
@@ -934,7 +990,7 @@ func (s *ChunkService) List(ctx context.Context, req *service.ListChunksRequest,
 			case "position_int":
 				result["positions"] = v
 			case "id":
-				result["chunk_id"] = v
+				result["id"] = v
 			case "content_with_weight":
 				result["content_with_weight"] = v
 			case "content":
@@ -1476,6 +1532,18 @@ type addChunkError struct {
 type updateChunkError struct {
 	code    common.ErrorCode
 	message string
+}
+
+type chunkReadError struct {
+	message string
+}
+
+func (e chunkReadError) Error() string {
+	return e.message
+}
+
+func (e chunkReadError) Code() common.ErrorCode {
+	return common.CodeDataError
 }
 
 func (e updateChunkError) Error() string {

@@ -53,7 +53,9 @@ type RetrievalTestResponse struct {
 
 // GetChunkRequest request for getting a chunk by ID
 type GetChunkRequest struct {
-	ChunkID string `json:"chunk_id"`
+	DatasetID  string `json:"-"`
+	DocumentID string `json:"-"`
+	ChunkID    string `json:"chunk_id"`
 }
 
 // GetChunkResponse response for getting a chunk
@@ -123,6 +125,7 @@ func IndexName(uid string) string {
 type ListChunksRequest struct {
 	DatasetID    string   `json:"dataset_id,omitempty"`
 	DocID        string   `json:"doc_id" binding:"required"`
+	ChunkID      string   `json:"-"`
 	ChunkIDs     []string `json:"chunk_ids,omitempty"`
 	Page         *int     `json:"page,omitempty"`
 	Size         *int     `json:"size,omitempty"`

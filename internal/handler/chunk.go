@@ -158,12 +158,19 @@ func (h *ChunkHandler) Get(c *gin.Context) {
 	}
 
 	req := &service.GetChunkRequest{
-		ChunkID: chunkID,
+		DatasetID:  c.Param("dataset_id"),
+		DocumentID: c.Param("document_id"),
+		ChunkID:    chunkID,
 	}
 
 	ctx := c.Request.Context()
 	resp, err := h.chunkService.Get(ctx, req, user.ID)
 	if err != nil {
+		var codedErr service.ErrorCoder
+		if errors.As(err, &codedErr) {
+			common.ResponseWithCodeData(c, codedErr.Code(), nil, err.Error())
+			return
+		}
 		common.ResponseWithHttpCodeData(c, http.StatusInternalServerError, 500, nil, err.Error())
 		return
 	}
@@ -235,6 +242,7 @@ func (h *ChunkHandler) ListChunks(c *gin.Context) {
 	req := service.ListChunksRequest{
 		DatasetID: datasetID,
 		DocID:     documentID,
+		ChunkID:   c.Query("id"),
 		ChunkIDs:  queryStringList(c, "chunk_ids"),
 		Page:      &page,
 		Size:      &size,
@@ -252,6 +260,11 @@ func (h *ChunkHandler) ListChunks(c *gin.Context) {
 	ctx := c.Request.Context()
 	resp, err := h.chunkService.List(ctx, &req, user.ID)
 	if err != nil {
+		var codedErr service.ErrorCoder
+		if errors.As(err, &codedErr) {
+			common.ResponseWithCodeData(c, codedErr.Code(), nil, err.Error())
+			return
+		}
 		common.ResponseWithHttpCodeData(c, http.StatusInternalServerError, common.CodeServerError, nil, err.Error())
 		return
 	}
