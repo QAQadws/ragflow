@@ -245,6 +245,44 @@ func TestChunkHandlerListChunksMapsPathAndQuery(t *testing.T) {
 	}
 }
 
+func TestChunkHandlerListPaginationDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		query      string
+		page, size int
+	}{
+		{"", 1, 30},
+		{"?page=&page_size=", 1, 30},
+		{"?page=0&page_size=0", 1, 30},
+		{"?page=-1&page_size=-2", 1, 30},
+		{"?page=a&page_size=1.5", 1, 30},
+		{"?page=2&page_size=5", 2, 5},
+		{"?page=a&page_size=5", 1, 5},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			mock := &mockChunkSvc{listFn: func(_ context.Context, req *service.ListChunksRequest, _ string) (*service.ListChunksResponse, error) {
+				if *req.Page != tc.page || *req.Size != tc.size {
+					t.Fatalf("pagination = %d/%d", *req.Page, *req.Size)
+				}
+				return &service.ListChunksResponse{Total: 7, Chunks: []map[string]interface{}{}}, nil
+			}}
+			r, h := setupChunkHandlerWithUser("user-1", mock)
+			r.GET("/datasets/:dataset_id/documents/:document_id/chunks", h.ListChunks)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/datasets/kb-1/documents/doc-1/chunks"+tc.query, nil))
+			var body struct {
+				Code int
+				Data struct{ Total int }
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if w.Code != 200 || body.Code != 0 || body.Data.Total != 7 {
+				t.Fatalf("response = %d %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
 func TestChunkHandlerListChunksMapsAvailableFalse(t *testing.T) {
 	mock := &mockChunkSvc{}
 	r, h := setupChunkHandlerWithUser("user-1", mock)

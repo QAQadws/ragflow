@@ -229,16 +229,8 @@ func (h *ChunkHandler) ListChunks(c *gin.Context) {
 		return
 	}
 
-	page, err := parsePositiveQueryInt(c, "page", 1)
-	if err != nil {
-		common.ResponseWithHttpCodeData(c, http.StatusBadRequest, common.CodeArgumentError, nil, err.Error())
-		return
-	}
-	size, err := parsePositiveQueryInt(c, "page_size", 30)
-	if err != nil {
-		common.ResponseWithHttpCodeData(c, http.StatusBadRequest, common.CodeArgumentError, nil, err.Error())
-		return
-	}
+	page := parsePositiveQueryInt(c, "page", 1)
+	size := parsePositiveQueryInt(c, "page_size", 30)
 
 	req := service.ListChunksRequest{
 		DatasetID: datasetID,
@@ -293,16 +285,13 @@ func queryStringList(c *gin.Context, name string) []string {
 	return ids
 }
 
-func parsePositiveQueryInt(c *gin.Context, name string, defaultValue int) (int, error) {
+func parsePositiveQueryInt(c *gin.Context, name string, defaultValue int) int {
 	raw := strings.TrimSpace(c.Query(name))
-	if raw == "" {
-		return defaultValue, nil
-	}
 	value, err := strconv.Atoi(raw)
 	if err != nil || value <= 0 {
-		return 0, fmt.Errorf("%s must be a positive integer", name)
+		return defaultValue
 	}
-	return value, nil
+	return value
 }
 
 func parseAvailableQuery(raw string) (int, bool, error) {

@@ -1902,8 +1902,10 @@ curl --request GET \
   The keywords used to match chunk content.
 - `page`(*Filter parameter*), `integer`
   Specifies the page on which the chunks will be displayed. Defaults to `1`.
+  Empty, non-integer, zero, or negative values use the default.
 - `page_size`(*Filter parameter*), `integer`
   The maximum number of chunks on each page. Defaults to `30`.
+  Empty, non-integer, zero, or negative values use the default. The response's `total` remains the total number of matching chunks, independent of pagination.
 - `id`(*Filter parameter*), `string`
   The ID of the chunk to retrieve. You can also use `GET /api/v1/datasets/{dataset_id}/documents/{document_id}/chunks/{chunk_id}` to retrieve one chunk.
 
