@@ -133,6 +133,61 @@ func TestSearchUsesConfiguredKNNNumCandidates(t *testing.T) {
 	}
 }
 
+func TestUpdateSingleChunkRetryOnConflict(t *testing.T) {
+	if err := common.InitLogger("info", common.FileOutput{}, "elasticsearch_test"); err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []int{http.StatusOK, http.StatusConflict, http.StatusNotFound, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			updateCalls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Elastic-Product", "Elasticsearch")
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/ragflow_tenant/_search":
+					_, _ = w.Write([]byte(`{"hits":{"hits":[{"_id":"actual-1"}]}}`))
+				case "/ragflow_tenant/_update/actual-1":
+					updateCalls++
+					if got := r.URL.Query().Get("retry_on_conflict"); got != "3" {
+						t.Errorf("retry_on_conflict = %q, want 3", got)
+					}
+					if got := r.URL.Query().Get("refresh"); got != "wait_for" {
+						t.Errorf("refresh = %q, want wait_for", got)
+					}
+					var body map[string]interface{}
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Error(err)
+					}
+					want := map[string]interface{}{"doc": map[string]interface{}{"content_with_weight": "edited", "available_int": float64(0)}}
+					if !reflect.DeepEqual(body, want) {
+						t.Errorf("update body = %#v, want %#v", body, want)
+					}
+					w.WriteHeader(status)
+					_, _ = w.Write([]byte(`{}`))
+				default:
+					t.Errorf("unexpected path %s", r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			client, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}, DisableRetry: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			engine := &Engine{client: client}
+			err = engine.updateSingleChunk(t.Context(), "ragflow_tenant", "chunk-1", map[string]interface{}{
+				"id": "chunk-1", "content_with_weight": "edited", "available_int": 0,
+			})
+			if (err == nil) != (status == http.StatusOK) {
+				t.Fatalf("status %d: error = %v", status, err)
+			}
+			if updateCalls != 1 {
+				t.Fatalf("update calls = %d, want one request using server-side retries", updateCalls)
+			}
+		})
+	}
+}
+
 func TestUpdateSingleMemoryMessageWaitsForRefresh(t *testing.T) {
 	var gotRefresh string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

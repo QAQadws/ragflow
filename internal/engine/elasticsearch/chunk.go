@@ -660,11 +660,13 @@ func (e *Engine) updateSingleChunk(ctx context.Context, indexName, chunkID strin
 		}
 		updateBody := map[string]interface{}{"doc": doc}
 		body, _ := json.Marshal(updateBody)
+		retryOnConflict := 3
 		req := esapi.UpdateRequest{
-			Index:      indexName,
-			DocumentID: actualID,
-			Body:       bytes.NewReader(body),
-			Refresh:    "wait_for",
+			Index:           indexName,
+			DocumentID:      actualID,
+			Body:            bytes.NewReader(body),
+			Refresh:         "wait_for",
+			RetryOnConflict: &retryOnConflict,
 		}
 		res, err := req.Do(ctx, e.client)
 		if err != nil {
