@@ -548,8 +548,9 @@ func TestUpdateChunkRejectsChunkFromAnotherDocument(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected UpdateChunk to reject a chunk from another document")
 	}
-	if !strings.Contains(err.Error(), "chunk not found") {
-		t.Fatalf("UpdateChunk error = %q, want chunk not found", err)
+	var coded service.ErrorCoder
+	if !errors.As(err, &coded) || coded.Code() != common.CodeDataError || err.Error() != "Can't find this chunk chunk-1" {
+		t.Fatalf("UpdateChunk error = %q, want missing chunk business error", err)
 	}
 	if len(engine.updateCalls) != 0 {
 		t.Fatalf("UpdateChunks calls = %d, want 0", len(engine.updateCalls))
@@ -596,6 +597,77 @@ func TestUpdateChunkUpdatesSameDocumentWithDocumentCondition(t *testing.T) {
 	}
 	if call.indexName != "ragflow_tenant-1" || call.datasetID != "kb-1" {
 		t.Fatalf("UpdateChunks target index=%q dataset=%q", call.indexName, call.datasetID)
+	}
+}
+
+func TestUpdateChunkValidationAndPersistence(t *testing.T) {
+	for _, tc := range []struct {
+		name, content, message                            string
+		omitContent, missing, compiled, deleted, internal bool
+		getErr, updateErr                                 error
+	}{
+		{name: "empty", message: "`content` is required"},
+		{name: "whitespace", content: " \n", message: "`content` is required"},
+		{name: "retain", omitContent: true},
+		{name: "valid", content: "edited"},
+		{name: "missing", missing: true, message: "Can't find this chunk c1"},
+		{name: "compiled", compiled: true, message: "Can't find this chunk c1"},
+		{name: "deleted document", deleted: true, message: "you don't own the document doc-1"},
+		{name: "engine missing", getErr: types.ErrDocumentNotFound, message: "Can't find this chunk c1"},
+		{name: "read failure", getErr: errors.New("read failed"), internal: true},
+		{name: "write failure", content: "edited", updateErr: errors.New("write failed"), internal: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupChunkTestDB(t)
+			pushChunkTestDB(t, db)
+			insertChunkTestUserTenant(t, "user-1", "tenant-1")
+			insertChunkTestKB(t, "kb-1", "tenant-1")
+			insertChunkTestDoc(t, "doc-1", "kb-1")
+			if tc.deleted {
+				if err := db.Where("id = ?", "doc-1").Delete(&entity.Document{}).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			chunk := map[string]interface{}{"doc_id": "doc-1", "content_with_weight": "original"}
+			if tc.compiled {
+				chunk["compile_kwd"] = "compiled"
+			}
+			engine := &updateChunkTestEngine{existingChunk: chunk, getErr: tc.getErr, updateErr: tc.updateErr}
+			if tc.missing {
+				engine.existingChunk = nil
+			}
+			svc := &ChunkService{docEngine: engine, kbDAO: dao.NewKnowledgebaseDAO(), userTenantDAO: dao.NewUserTenantDAO()}
+			available := false
+			req := &service.UpdateChunkRequest{DatasetID: "kb-1", DocumentID: "doc-1", ChunkID: "c1", Content: &tc.content, Available: &available}
+			if tc.omitContent {
+				req.Content = nil
+			}
+			err := svc.UpdateChunk(t.Context(), req, "user-1")
+			var coded service.ErrorCoder
+			if tc.internal {
+				if err == nil || errors.As(err, &coded) {
+					t.Fatalf("expected internal error, got %v", err)
+				}
+			} else if tc.message != "" {
+				if !errors.As(err, &coded) || coded.Code() != common.CodeDataError || err.Error() != tc.message {
+					t.Fatalf("error = %v", err)
+				}
+				if len(engine.updateCalls) != 0 {
+					t.Fatal("invalid update reached engine")
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := tc.content
+				if tc.omitContent {
+					want = "original"
+				}
+				if len(engine.updateCalls) != 1 || engine.updateCalls[0].newValue["content_with_weight"] != want || engine.updateCalls[0].newValue["available_int"] != 0 {
+					t.Fatalf("updates = %#v", engine.updateCalls)
+				}
+			}
+		})
 	}
 }
 
@@ -1506,12 +1578,13 @@ func (e *listChunksSearchEngine) GetChunk(_ context.Context, indexName, chunkID 
 
 type updateChunkTestEngine struct {
 	parseTestDocEngine
-	existingChunk interface{}
-	updateCalls   []updateChunksCall
+	existingChunk     interface{}
+	updateCalls       []updateChunksCall
+	getErr, updateErr error
 }
 
 func (e *updateChunkTestEngine) GetChunk(context.Context, string, string, []string) (interface{}, error) {
-	return e.existingChunk, nil
+	return e.existingChunk, e.getErr
 }
 
 func (e *updateChunkTestEngine) UpdateChunks(_ context.Context, condition, newValue map[string]interface{}, indexName, datasetID string) error {
@@ -1521,7 +1594,7 @@ func (e *updateChunkTestEngine) UpdateChunks(_ context.Context, condition, newVa
 		indexName: indexName,
 		datasetID: datasetID,
 	})
-	return nil
+	return e.updateErr
 }
 
 type chunkImageStorage struct {

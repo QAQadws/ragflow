@@ -1159,52 +1159,23 @@ func (s *ChunkService) UpdateChunk(ctx context.Context, req *service.UpdateChunk
 		return fmt.Errorf("chunk_id is required")
 	}
 
-	// Get user's tenants
-	tenants, err := s.userTenantDAO.GetByUserID(ctx, dao.DB, userID)
+	_, targetTenantID, err := s.resolveRESTChunkDocument(ctx, req.DatasetID, req.DocumentID, userID)
 	if err != nil {
-		return fmt.Errorf("failed to get user tenants: %w", err)
-	}
-	if len(tenants) == 0 {
-		return fmt.Errorf("user has no accessible tenants")
-	}
-
-	// Find the tenant that owns this dataset
-	var targetTenantID string
-	for _, tenant := range tenants {
-		kb, err := s.kbDAO.GetByIDAndTenantID(ctx, dao.DB, req.DatasetID, tenant.TenantID)
-		if err == nil && kb != nil {
-			targetTenantID = tenant.TenantID
-			break
-		}
-	}
-	if targetTenantID == "" {
-		return fmt.Errorf("user does not have access to this dataset")
-	}
-
-	// Verify document belongs to dataset
-	docDAO := dao.NewDocumentDAO()
-	doc, err := docDAO.GetByID(ctx, dao.DB, req.DocumentID)
-	if err != nil || doc == nil {
-		return fmt.Errorf("document not found")
-	}
-	if doc.KbID != req.DatasetID {
-		return fmt.Errorf("document does not belong to this dataset")
+		return err
 	}
 
 	// Fetch existing chunk first
 	indexName := fmt.Sprintf("ragflow_%s", targetTenantID)
-	existingChunk, err := s.docEngine.GetChunk(ctx, indexName, req.ChunkID, []string{req.DatasetID})
+	existing, err := s.getScopedChunk(ctx, indexName, req.DatasetID, req.DocumentID, req.ChunkID)
 	if err != nil {
 		return fmt.Errorf("failed to get existing chunk: %w", err)
 	}
 
-	existing, ok := existingChunk.(map[string]interface{})
-	if !ok {
-		return fmt.Errorf("invalid chunk format")
+	if existing == nil {
+		return updateChunkError{code: common.CodeDataError, message: fmt.Sprintf("Can't find this chunk %s", req.ChunkID)}
 	}
-	existingDocumentID, ok := existing["doc_id"].(string)
-	if !ok || existingDocumentID != req.DocumentID {
-		return fmt.Errorf("chunk not found")
+	if req.Content != nil && strings.TrimSpace(*req.Content) == "" {
+		return updateChunkError{code: common.CodeDataError, message: "`content` is required"}
 	}
 
 	// Build update dict

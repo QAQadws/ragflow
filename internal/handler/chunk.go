@@ -569,29 +569,60 @@ func (h *ChunkHandler) UpdateChunk(c *gin.Context) {
 
 	// Build UpdateChunkRequest from rawBody
 	var req service.UpdateChunkRequest
-	if content, ok := rawBody["content"].(string); ok {
+	var validatedTagKwd []string
+	if value, present := rawBody["content"]; present && value != nil {
+		content, ok := value.(string)
+		if !ok {
+			common.ResponseWithCodeData(c, common.CodeDataError, nil, "`content` must be a string")
+			return
+		}
 		req.Content = &content
 	}
-	if importantKwd, ok := rawBody["important_keywords"].([]interface{}); ok {
-		req.ImportantKwd = make([]string, len(importantKwd))
-		for i, v := range importantKwd {
-			if s, ok := v.(string); ok {
-				req.ImportantKwd[i] = s
-			}
+	for _, field := range []struct {
+		name   string
+		target *[]string
+	}{
+		{"important_keywords", &req.ImportantKwd},
+		{"questions", &req.Questions},
+		{"tag_kwd", &validatedTagKwd},
+	} {
+		value, present := rawBody[field.name]
+		if !present {
+			continue
 		}
-	}
-	if questions, ok := rawBody["questions"].([]interface{}); ok {
-		req.Questions = make([]string, len(questions))
-		for i, v := range questions {
-			if s, ok := v.(string); ok {
-				req.Questions[i] = s
-			}
+		items, ok := value.([]interface{})
+		if !ok {
+			common.ResponseWithCodeData(c, common.CodeDataError, nil, "`"+field.name+"` should be a list")
+			return
 		}
+		values := make([]string, len(items))
+		for i, item := range items {
+			text, ok := item.(string)
+			if !ok {
+				common.ResponseWithCodeData(c, common.CodeDataError, nil, "`"+field.name+"` must be a list of strings")
+				return
+			}
+			values[i] = text
+		}
+		*field.target = values
 	}
-	if available, ok := rawBody["available"].(bool); ok {
+	if value, present := rawBody["available"]; present {
+		available, ok := value.(bool)
+		if number, numeric := value.(float64); numeric && (number == 0 || number == 1) {
+			available, ok = number == 1, true
+		}
+		if !ok {
+			common.ResponseWithCodeData(c, common.CodeDataError, nil, "`available` must be a boolean or 0 or 1")
+			return
+		}
 		req.Available = &available
 	}
-	if positions, ok := rawBody["positions"].([]interface{}); ok {
+	if value, present := rawBody["positions"]; present {
+		positions, ok := value.([]interface{})
+		if !ok {
+			common.ResponseWithCodeData(c, common.CodeDataError, nil, "`positions` should be a list")
+			return
+		}
 		req.Positions = positions
 	}
 	req.TagFeas = rawBody["tag_feas"]
@@ -604,12 +635,13 @@ func (h *ChunkHandler) UpdateChunk(c *gin.Context) {
 	ctx := c.Request.Context()
 	err := h.chunkService.UpdateChunk(ctx, &req, user.ID)
 	if err != nil {
-		var coded interface {
-			Code() common.ErrorCode
-		}
+		var coded service.ErrorCoder
 		if errors.As(err, &coded) {
 			switch coded.Code() {
-			case common.CodeArgumentError, common.CodeBadRequest, common.CodeDataError:
+			case common.CodeDataError:
+				common.ResponseWithCodeData(c, coded.Code(), nil, err.Error())
+				return
+			case common.CodeArgumentError, common.CodeBadRequest:
 				common.ResponseWithHttpCodeData(c, http.StatusBadRequest, coded.Code(), nil, err.Error())
 				return
 			}

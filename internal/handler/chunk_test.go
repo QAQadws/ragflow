@@ -418,6 +418,84 @@ func TestChunkHandlerUpdateChunkUsesPathIDs(t *testing.T) {
 	}
 }
 
+func TestChunkHandlerUpdateChunkInputs(t *testing.T) {
+	for _, tc := range []struct {
+		body, message string
+		status, code  int
+		serviceErr    error
+	}{
+		{body: `{}`, status: 200},
+		{body: `{"content":null}`, status: 200},
+		{body: `{"content":42}`, status: 200, code: 102, message: "`content` must be a string"},
+		{body: `{"important_keywords":[1]}`, status: 200, code: 102, message: "`important_keywords` must be a list of strings"},
+		{body: `{"questions":["valid",false]}`, status: 200, code: 102, message: "`questions` must be a list of strings"},
+		{body: `{"tag_kwd":[null]}`, status: 200, code: 102, message: "`tag_kwd` must be a list of strings"},
+		{body: `{"important_keywords":null}`, status: 200, code: 102, message: "`important_keywords` should be a list"},
+		{body: `{"questions":"question"}`, status: 200, code: 102, message: "`questions` should be a list"},
+		{body: `{"positions":null}`, status: 200, code: 102, message: "`positions` should be a list"},
+		{body: `{"positions":{}}`, status: 200, code: 102, message: "`positions` should be a list"},
+		{body: `{"available":"True"}`, status: 200, code: 102, message: "`available` must be a boolean or 0 or 1"},
+		{body: `{"available":2}`, status: 200, code: 102, message: "`available` must be a boolean or 0 or 1"},
+		{body: `{"available":0.5}`, status: 200, code: 102, message: "`available` must be a boolean or 0 or 1"},
+		{body: `{"available":null}`, status: 200, code: 102, message: "`available` must be a boolean or 0 or 1"},
+		{body: `{"unknown_key":1}`, status: 400, code: 400, message: "Update field 'unknown_key' is not supported."},
+		{body: `{}`, status: 200, code: 102, serviceErr: codedTestError{common.CodeDataError, "missing"}, message: "missing"},
+		{body: `{}`, status: 500, code: 500, serviceErr: errors.New("database failed"), message: "database failed"},
+	} {
+		t.Run(tc.body+tc.message, func(t *testing.T) {
+			called := false
+			mock := &mockChunkSvc{updateChunkFn: func(_ context.Context, req *service.UpdateChunkRequest, _ string) error {
+				called = true
+				if req.Content != nil {
+					t.Fatalf("content = %v", req.Content)
+				}
+				return tc.serviceErr
+			}}
+			r, h := setupChunkHandlerWithUser("user-1", mock)
+			r.PATCH("/datasets/:dataset_id/documents/:document_id/chunks/:chunk_id", h.UpdateChunk)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest(http.MethodPatch, "/datasets/kb-1/documents/doc-1/chunks/c1", strings.NewReader(tc.body)))
+			var body struct {
+				Code    int
+				Message string
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if w.Code != tc.status || body.Code != tc.code || !strings.Contains(body.Message, tc.message) {
+				t.Fatalf("response = %d %s", w.Code, w.Body.String())
+			}
+			if tc.code != 0 && tc.serviceErr == nil && called {
+				t.Fatal("invalid input reached service")
+			}
+		})
+	}
+}
+
+func TestChunkHandlerUpdateChunkFrontendPayload(t *testing.T) {
+	for _, value := range []string{"true", "false", "1", "0"} {
+		t.Run(value, func(t *testing.T) {
+			mock := &mockChunkSvc{updateChunkFn: func(_ context.Context, req *service.UpdateChunkRequest, _ string) error {
+				if req.Available == nil || *req.Available != (value == "true" || value == "1") {
+					t.Fatalf("available = %v", req.Available)
+				}
+				if req.Content == nil || *req.Content != "edited" || !reflect.DeepEqual(req.ImportantKwd, []string{"keyword"}) || !reflect.DeepEqual(req.Questions, []string{"question"}) || req.Positions == nil || !reflect.DeepEqual(req.TagFeas, map[string]interface{}{"tag": float64(2)}) {
+					t.Fatalf("request = %#v", req)
+				}
+				return nil
+			}}
+			r, h := setupChunkHandlerWithUser("user-1", mock)
+			r.PATCH("/datasets/:dataset_id/documents/:document_id/chunks/:chunk_id", h.UpdateChunk)
+			body := `{"content":"edited","important_keywords":["keyword"],"questions":["question"],"tag_kwd":["tag"],"tag_feas":{"tag":2},"positions":[],"available":` + value + `}`
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest(http.MethodPatch, "/datasets/kb-1/documents/doc-1/chunks/c1", strings.NewReader(body)))
+			if w.Code != 200 || !strings.Contains(w.Body.String(), `"code":0`) {
+				t.Fatalf("response = %d %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
 func TestChunkHandlerUpdateChunkValidationErrorIsBadRequest(t *testing.T) {
 	mock := &mockChunkSvc{}
 	r, h := setupChunkHandlerWithUser("user-1", mock)

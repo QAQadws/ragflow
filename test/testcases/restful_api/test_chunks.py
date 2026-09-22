@@ -681,20 +681,30 @@ def test_chunk_update_content_and_available_contract(rest_client, create_documen
 
     available_cases = [
         ("available true", {"available": True}, 0, ""),
-        ("available true str", {"available": "True"}, 100, "invalid literal for int()"),
+        ("available true str", {"available": "True"}, 102, "`available` must be a boolean or 0 or 1"),
         ("available one", {"available": 1}, 0, ""),
         ("available false", {"available": False}, 0, ""),
-        ("available false str", {"available": "False"}, 100, "invalid literal for int()"),
+        ("available false str", {"available": "False"}, 102, "`available` must be a boolean or 0 or 1"),
         ("available zero", {"available": 0}, 0, ""),
     ]
     for scenario_name, payload, expected_code, expected_message in available_cases:
         _, _, chunk_id, base_path = _create_chunk_for_update(rest_client, create_document, f"{scenario_name}.txt")
+        if expected_code == 0:
+            initial_res = rest_client.patch(f"{base_path}/{chunk_id}", json={"available": not bool(payload["available"])})
+            assert initial_res.status_code == 200, (scenario_name, initial_res.text)
+            assert initial_res.json()["code"] == 0, (scenario_name, initial_res.json())
         res = rest_client.patch(f"{base_path}/{chunk_id}", json=payload)
         assert res.status_code == 200, (scenario_name, res.text)
         body = res.json()
         assert body["code"] == expected_code, (scenario_name, body)
         if expected_code != 0:
             assert expected_message in body["message"], (scenario_name, body)
+        else:
+            read_res = rest_client.get(f"{base_path}/{chunk_id}")
+            assert read_res.status_code == 200, (scenario_name, read_res.text)
+            read_body = read_res.json()
+            assert read_body["code"] == 0, (scenario_name, read_body)
+            assert read_body["data"]["available_int"] == int(payload["available"]), (scenario_name, read_body)
 
 
 @pytest.mark.p3
@@ -703,13 +713,13 @@ def test_chunk_update_keywords_questions_and_tag_contract(rest_client, create_do
     cases = [
         ("important keywords", {"important_keywords": ["a", "b", "c"]}, 0, ""),
         ("important keywords empty", {"important_keywords": [""]}, 0, ""),
-        ("important keywords int", {"important_keywords": [1]}, 100, "TypeError"),
+        ("important keywords int", {"important_keywords": [1]}, 102, "`important_keywords` must be a list of strings"),
         ("important keywords dup", {"important_keywords": ["a", "a"]}, 0, ""),
         ("important keywords str", {"important_keywords": "abc"}, 102, "`important_keywords` should be a list"),
         ("important keywords number", {"important_keywords": 123}, 102, "`important_keywords` should be a list"),
         ("questions", {"questions": ["a", "b", "c"]}, 0, ""),
         ("questions empty", {"questions": [""]}, 0, ""),
-        ("questions int", {"questions": [1]}, 100, "TypeError"),
+        ("questions int", {"questions": [1]}, 102, "`questions` must be a list of strings"),
         ("questions dup", {"questions": ["a", "a"]}, 0, ""),
         ("questions str", {"questions": "abc"}, 102, "`questions` should be a list"),
         ("questions number", {"questions": 123}, 102, "`questions` should be a list"),
@@ -763,14 +773,16 @@ def test_chunk_update_invalid_target_and_param_contract(rest_client, create_docu
     assert invalid_chunk_payload["code"] == 102, invalid_chunk_payload
     assert invalid_chunk_payload["message"] == f"Can't find this chunk {INVALID_ID_32}", invalid_chunk_payload
 
-    for scenario_name, payload in (
-        ("unknown key", {"unknown_key": "unknown_value"}),
-        ("empty payload", {}),
+    for scenario_name, payload, expected_status, expected_code in (
+        ("unknown key", {"unknown_key": "unknown_value"}, 400, 400),
+        ("empty payload", {}, 200, 0),
     ):
         res = rest_client.patch(f"{base_path}/{chunk_id}", json=payload)
-        assert res.status_code == 200, (scenario_name, res.text)
+        assert res.status_code == expected_status, (scenario_name, res.text)
         body = res.json()
-        assert body["code"] == 0, (scenario_name, body)
+        assert body["code"] == expected_code, (scenario_name, body)
+        if expected_code != 0:
+            assert "Update field 'unknown_key' is not supported." in body["message"], (scenario_name, body)
 
 
 @pytest.mark.p3

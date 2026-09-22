@@ -2165,23 +2165,26 @@ curl --request PATCH \
 - `chunk_id`: (*Path parameter*)
   The ID of the chunk to update.
 - `"content"`: (*Body parameter*), `string`
-  The text content of the chunk.
+  The text content of the chunk. Omitted or `null` leaves the content unchanged; an empty or whitespace-only string is rejected.
 - `"important_keywords"`: (*Body parameter*), `list[string]`
   A list of key terms or phrases to tag with the chunk.
 - `"questions"`: (*Body parameter*), `list[string]`
   Optional questions to use when embedding the chunk.
 - `"positions"`: (*Body parameter*), `list`
-  Updated source positions for the chunk.
+  Updated source positions for the chunk. Must be an array.
 - `"tag_kwd"`: (*Body parameter*), `list[string]`
   Updated tag keywords.
 - `"available"`: (*Body parameter*) `boolean`
   The chunk's availability status in the dataset. Value options:
   - `true`: Available (default)
   - `false`: Unavailable
+  Integer `1` and `0` are also accepted. Strings such as `"True"` and `"False"` are rejected.
 - `"image_base64"`: (*Body parameter*), `string`
   Base64-encoded image content to associate with the chunk.
 - `"user_id"`: (*Body parameter*), `string`, *Optional*
   End-user identifier forwarded as the OpenAI `user` field on the embedding request for this update. Omitted when unset.
+
+`important_keywords`, `questions`, and `tag_kwd` must be arrays containing only strings. Invalid content, availability, or array values return HTTP `200` with code `102`. An empty object `{}` succeeds. Unknown update fields are rejected with HTTP `400` and code `400`.
 
 #### Response
 
