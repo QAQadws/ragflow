@@ -1220,6 +1220,9 @@ func (s *ChunkService) UpdateChunk(ctx context.Context, req *service.UpdateChunk
 		}
 		d["question_kwd"] = filteredQuestions
 	}
+	if req.TagKeywords != nil {
+		d["tag_kwd"] = req.TagKeywords
+	}
 
 	// Available
 	if req.Available != nil {
@@ -1406,6 +1409,9 @@ func (s *ChunkService) AddChunk(ctx context.Context, req *service.AddChunkReques
 		"docnm_kwd":            docName,
 		"doc_id":               req.DocumentID,
 	}
+	if req.TagKeywords != nil {
+		chunkData["tag_kwd"] = req.TagKeywords
+	}
 	if tagFeas != nil {
 		chunkData["tag_feas"] = tagFeas
 	}
@@ -1468,6 +1474,9 @@ func (s *ChunkService) AddChunk(ctx context.Context, req *service.AddChunkReques
 		"dataset_id":         req.DatasetID,
 		"create_timestamp":   chunkData["create_timestamp_flt"],
 		"create_time":        chunkData["create_time"],
+	}
+	if req.TagKeywords != nil {
+		renamedChunk["tag_kwd"] = req.TagKeywords
 	}
 	if imgID, ok := chunkData["img_id"]; ok {
 		renamedChunk["image_id"] = imgID

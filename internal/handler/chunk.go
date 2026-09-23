@@ -552,24 +552,18 @@ func (h *ChunkHandler) UpdateChunk(c *gin.Context) {
 		"questions":          true,
 		"available":          true,
 		"positions":          true,
-		// Accepted but never persisted: the UI always sends tag_kwd, so
-		// dropping it here would 400 every chunk edit. Go's tagger writes
-		// tag_feas; tag_kwd belongs to a Python tag dataset
-		// (rag/app/tag.py::beAdoc), which Go never builds. Left out of the
-		// error text below so it does not read as updatable.
-		"tag_kwd":  true,
-		"tag_feas": true,
+		"tag_kwd":            true,
+		"tag_feas":           true,
 	}
 	for field := range rawBody {
 		if field != "dataset_id" && field != "document_id" && field != "chunk_id" && !allowedFields[field] {
-			common.ResponseWithHttpCodeData(c, http.StatusBadRequest, 400, nil, "Update field '"+field+"' is not supported. Updatable fields: content, important_keywords, questions, available, positions, tag_feas")
+			common.ResponseWithHttpCodeData(c, http.StatusBadRequest, 400, nil, "Update field '"+field+"' is not supported. Updatable fields: content, important_keywords, questions, available, positions, tag_kwd, tag_feas")
 			return
 		}
 	}
 
 	// Build UpdateChunkRequest from rawBody
 	var req service.UpdateChunkRequest
-	var validatedTagKwd []string
 	if value, present := rawBody["content"]; present && value != nil {
 		content, ok := value.(string)
 		if !ok {
@@ -584,7 +578,7 @@ func (h *ChunkHandler) UpdateChunk(c *gin.Context) {
 	}{
 		{"important_keywords", &req.ImportantKwd},
 		{"questions", &req.Questions},
-		{"tag_kwd", &validatedTagKwd},
+		{"tag_kwd", &req.TagKeywords},
 	} {
 		value, present := rawBody[field.name]
 		if !present {
@@ -791,6 +785,11 @@ func (h *ChunkHandler) AddChunk(c *gin.Context) {
 		common.ResponseWithCodeData(c, common.CodeDataError, nil, err.Error())
 		return
 	}
+	tagKeywords, err := addChunkStringListField(rawBody, "tag_kwd", "`tag_kwd` is required to be a list", "`tag_kwd` must be a list of strings")
+	if err != nil {
+		common.ResponseWithCodeData(c, common.CodeDataError, nil, err.Error())
+		return
+	}
 	imageBase64, err := addChunkStringPtrField(rawBody, "image_base64")
 	if err != nil {
 		common.ResponseWithCodeData(c, common.CodeArgumentError, nil, err.Error())
@@ -810,6 +809,7 @@ func (h *ChunkHandler) AddChunk(c *gin.Context) {
 		Content:           content,
 		ImportantKeywords: importantKeywords,
 		Questions:         questions,
+		TagKeywords:       tagKeywords,
 		TagFeas:           tagFeas,
 		ImageBase64:       imageBase64,
 	}

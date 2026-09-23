@@ -528,9 +528,10 @@ func TestUpdateChunkUpdatesSameDocumentWithDocumentCondition(t *testing.T) {
 	}
 
 	err := svc.UpdateChunk(t.Context(), &service.UpdateChunkRequest{
-		DatasetID:  "kb-1",
-		DocumentID: "doc-a",
-		ChunkID:    "chunk-1",
+		DatasetID:   "kb-1",
+		DocumentID:  "doc-a",
+		ChunkID:     "chunk-1",
+		TagKeywords: []string{"tag1", "tag2"},
 	}, "user-1")
 	if err != nil {
 		t.Fatalf("UpdateChunk() error = %v", err)
@@ -547,6 +548,9 @@ func TestUpdateChunkUpdatesSameDocumentWithDocumentCondition(t *testing.T) {
 	}
 	if call.indexName != "ragflow_tenant-1" || call.datasetID != "kb-1" {
 		t.Fatalf("UpdateChunks target index=%q dataset=%q", call.indexName, call.datasetID)
+	}
+	if !reflect.DeepEqual(call.newValue["tag_kwd"], []string{"tag1", "tag2"}) {
+		t.Fatalf("UpdateChunks tag_kwd = %#v", call.newValue["tag_kwd"])
 	}
 }
 
@@ -599,6 +603,7 @@ func TestAddChunkSuccess(t *testing.T) {
 		Content:           "chunk body",
 		ImportantKeywords: []string{"k1"},
 		Questions:         []string{" q1 ", ""},
+		TagKeywords:       []string{"tag1", "tag2"},
 		TagFeas:           map[string]interface{}{"tag1": float64(0.5)},
 	}, userID)
 	if err != nil {
@@ -616,6 +621,9 @@ func TestAddChunkSuccess(t *testing.T) {
 	if resp.Chunk["document"] != "doc-1.txt" {
 		t.Fatalf("document = %v, want doc-1.txt", resp.Chunk["document"])
 	}
+	if !reflect.DeepEqual(resp.Chunk["tag_kwd"], []string{"tag1", "tag2"}) {
+		t.Fatalf("response tag_kwd = %#v", resp.Chunk["tag_kwd"])
+	}
 	if incrementChunkNum != 1 {
 		t.Fatalf("increment chunk num = %d, want 1", incrementChunkNum)
 	}
@@ -631,6 +639,9 @@ func TestAddChunkSuccess(t *testing.T) {
 	}
 	if inserted["img_id"] != nil {
 		t.Fatalf("did not expect image id in inserted chunk: %#v", inserted)
+	}
+	if !reflect.DeepEqual(inserted["tag_kwd"], []string{"tag1", "tag2"}) {
+		t.Fatalf("inserted tag_kwd = %#v", inserted["tag_kwd"])
 	}
 	vec, ok := inserted["q_2_vec"].([]float64)
 	if !ok {

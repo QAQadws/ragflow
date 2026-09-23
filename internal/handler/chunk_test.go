@@ -283,10 +283,13 @@ func TestChunkHandlerUpdateChunkUsesPathIDs(t *testing.T) {
 		if req.Content == nil || *req.Content != "updated" {
 			t.Fatalf("content = %v, want updated", req.Content)
 		}
+		if !reflect.DeepEqual(req.TagKeywords, []string{"tag1"}) {
+			t.Fatalf("tag keywords = %#v, want [tag1]", req.TagKeywords)
+		}
 		return nil
 	}
 
-	req := httptest.NewRequest(http.MethodPatch, "/api/v1/datasets/kb-1/documents/doc-1/chunks/chunk-1", strings.NewReader(`{"content":"updated"}`))
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/datasets/kb-1/documents/doc-1/chunks/chunk-1", strings.NewReader(`{"content":"updated","tag_kwd":["tag1"]}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -652,7 +655,7 @@ func TestChunkHandlerAddChunkSuccess(t *testing.T) {
 			if userID != "user1" {
 				t.Fatalf("userID = %q, want user1", userID)
 			}
-			if req.DatasetID != "kb1" || req.DocumentID != "doc1" || req.Content != "chunk body" {
+			if req.DatasetID != "kb1" || req.DocumentID != "doc1" || req.Content != "chunk body" || !reflect.DeepEqual(req.TagKeywords, []string{"tag1"}) {
 				t.Fatalf("unexpected request: %#v", req)
 			}
 			return &service.AddChunkResponse{Chunk: map[string]interface{}{"id": "chunk-1", "content": req.Content}}, nil
@@ -668,7 +671,7 @@ func TestChunkHandlerAddChunkSuccess(t *testing.T) {
 	r.POST("/api/v1/datasets/:dataset_id/documents/:document_id/chunks", h.AddChunk)
 
 	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/api/v1/datasets/kb1/documents/doc1/chunks", strings.NewReader(`{"content":"chunk body"}`))
+	req, _ := http.NewRequest("POST", "/api/v1/datasets/kb1/documents/doc1/chunks", strings.NewReader(`{"content":"chunk body","tag_kwd":["tag1"]}`))
 	req.Header.Set("Content-Type", "application/json")
 	r.ServeHTTP(w, req)
 
@@ -757,6 +760,16 @@ func TestChunkHandlerAddChunkValidatesListFields(t *testing.T) {
 			name:    "important keywords type",
 			body:    `{"content":"chunk body","important_keywords":{}}`,
 			wantMsg: "`important_keywords` is required to be a list",
+		},
+		{
+			name:    "tag keywords type",
+			body:    `{"content":"chunk body","tag_kwd":"tag"}`,
+			wantMsg: "`tag_kwd` is required to be a list",
+		},
+		{
+			name:    "tag keywords element",
+			body:    `{"content":"chunk body","tag_kwd":[1]}`,
+			wantMsg: "`tag_kwd` must be a list of strings",
 		},
 	}
 
