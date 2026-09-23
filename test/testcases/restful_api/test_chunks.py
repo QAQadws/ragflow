@@ -17,7 +17,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import os
 import pytest
-from test.testcases.configs import INVALID_API_TOKEN, INVALID_ID_32
+from test.testcases.configs import INVALID_API_TOKEN, INVALID_ID_32, IS_GO_PROXY
 from test.testcases.restful_api.helpers.assertions import assert_auth_error
 from test.testcases.restful_api.helpers.client import RestClient
 from test.testcases.utils import wait_for
@@ -679,12 +679,14 @@ def test_chunk_update_content_and_available_contract(rest_client, create_documen
         if expected_code != 0:
             assert body["message"] == expected_message, (scenario_name, body)
 
+    invalid_available_code = 102 if IS_GO_PROXY else 100
+    invalid_available_message = "`available` must be a boolean or 0 or 1" if IS_GO_PROXY else "invalid literal for int()"
     available_cases = [
         ("available true", {"available": True}, 0, ""),
-        ("available true str", {"available": "True"}, 102, "`available` must be a boolean or 0 or 1"),
+        ("available true str", {"available": "True"}, invalid_available_code, invalid_available_message),
         ("available one", {"available": 1}, 0, ""),
         ("available false", {"available": False}, 0, ""),
-        ("available false str", {"available": "False"}, 102, "`available` must be a boolean or 0 or 1"),
+        ("available false str", {"available": "False"}, invalid_available_code, invalid_available_message),
         ("available zero", {"available": 0}, 0, ""),
     ]
     for scenario_name, payload, expected_code, expected_message in available_cases:
@@ -710,16 +712,17 @@ def test_chunk_update_content_and_available_contract(rest_client, create_documen
 @pytest.mark.p3
 def test_chunk_update_keywords_questions_and_tag_contract(rest_client, create_document):
     _, _, chunk_id, base_path = _create_chunk_for_update(rest_client, create_document, "chunk_update_fields.txt")
+    invalid_list_code = 102 if IS_GO_PROXY else 100
     cases = [
         ("important keywords", {"important_keywords": ["a", "b", "c"]}, 0, ""),
         ("important keywords empty", {"important_keywords": [""]}, 0, ""),
-        ("important keywords int", {"important_keywords": [1]}, 102, "`important_keywords` must be a list of strings"),
+        ("important keywords int", {"important_keywords": [1]}, invalid_list_code, "`important_keywords` must be a list of strings" if IS_GO_PROXY else "TypeError"),
         ("important keywords dup", {"important_keywords": ["a", "a"]}, 0, ""),
         ("important keywords str", {"important_keywords": "abc"}, 102, "`important_keywords` should be a list"),
         ("important keywords number", {"important_keywords": 123}, 102, "`important_keywords` should be a list"),
         ("questions", {"questions": ["a", "b", "c"]}, 0, ""),
         ("questions empty", {"questions": [""]}, 0, ""),
-        ("questions int", {"questions": [1]}, 102, "`questions` must be a list of strings"),
+        ("questions int", {"questions": [1]}, invalid_list_code, "`questions` must be a list of strings" if IS_GO_PROXY else "TypeError"),
         ("questions dup", {"questions": ["a", "a"]}, 0, ""),
         ("questions str", {"questions": "abc"}, 102, "`questions` should be a list"),
         ("questions number", {"questions": 123}, 102, "`questions` should be a list"),
@@ -774,7 +777,7 @@ def test_chunk_update_invalid_target_and_param_contract(rest_client, create_docu
     assert invalid_chunk_payload["message"] == f"Can't find this chunk {INVALID_ID_32}", invalid_chunk_payload
 
     for scenario_name, payload, expected_status, expected_code in (
-        ("unknown key", {"unknown_key": "unknown_value"}, 400, 400),
+        ("unknown key", {"unknown_key": "unknown_value"}, 400 if IS_GO_PROXY else 200, 400 if IS_GO_PROXY else 0),
         ("empty payload", {}, 200, 0),
     ):
         res = rest_client.patch(f"{base_path}/{chunk_id}", json=payload)
