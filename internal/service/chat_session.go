@@ -1344,7 +1344,7 @@ func isChatSessionNotFound(err error) bool {
 }
 
 // ChatCompletions handles chat completion matching Python's session_completion.
-// When stream=true, returns nil result and streams SSE via streamChan.
+// When stream=true, returns nil result and sends native frames via streamChan.
 // When stream=false, returns the structured answer map.
 func (s *ChatSessionService) ChatCompletions(
 	ctx context.Context,
@@ -1353,24 +1353,15 @@ func (s *ChatSessionService) ChatCompletions(
 	messages []map[string]interface{}, question string, files []interface{},
 	llmID string, genConfig map[string]interface{}, kwargs map[string]interface{},
 	legacy bool,
-	stream bool, streamChan chan<- string,
+	stream bool, streamChan chan<- NativeChatFrame,
 ) (map[string]interface{}, error) {
 
 	receivedAt := float64(time.Now().UnixNano()) / 1e9
 	fail := func(err error) (map[string]interface{}, error) {
 		if stream && streamChan != nil {
-			s.sendSSEError(streamChan, err.Error())
+			sendNativeChatFrame(ctx, streamChan, nativeChatErrorFrame(err.Error()))
 		}
 		return nil, err
-	}
-
-	sendOrCancel := func(data string) bool {
-		select {
-		case streamChan <- data:
-			return true
-		case <-ctx.Done():
-			return false
-		}
 	}
 
 	// Correlate every log line this request emits (retrieval, model calls)
@@ -1500,171 +1491,58 @@ func (s *ChatSessionService) ChatCompletions(
 	}
 
 	if stream && streamChan != nil {
-		var fullAnswer strings.Builder
-		var finalLegacyAnswer map[string]interface{}
+		translator := newNativeChatStreamTranslator(legacy, messageID, sessionID, chatID, reference)
+		for {
+			select {
+			case <-ctx.Done():
+				translator.Finish(generationCanceled)
+				drainNativeChatResults(resultChan)
+				return nil, nil
+			case result, ok := <-resultChan:
+				if !ok {
+					translator.Finish(generationIncomplete)
+					sendNativeChatFrame(ctx, streamChan, nativeChatDoneFrame())
+					return nil, nil
+				}
 
-		for result := range resultChan {
-			if result.Reference != nil && len(reference) > 0 {
-				reference[len(reference)-1] = result.Reference
-			}
-			if result.Final {
-				failed := strings.Contains(result.Answer, "**ERROR**")
-				if session != nil && !failed {
-					// Store with <think>thinking content</think>
-					content := fullAnswer.String()
+				translation := translator.Translate(result)
+				if translation.terminal == nil {
+					if session != nil {
+						s.appendAssistantToSession(session, translation.streamedAnswer, messageID)
+					}
+					if !sendNativeChatFrames(ctx, streamChan, translation.frames) {
+						translator.Finish(generationCanceled)
+						drainNativeChatResults(resultChan)
+						return nil, nil
+					}
+					continue
+				}
+
+				material := *translation.terminal
+				if session != nil && material.outcome == generationComplete {
+					content := material.streamedAnswer
 					if content == "" {
-						content = result.Answer
+						content = material.finalAnswer
 					}
 					s.appendAssistantToSession(session, content, messageID)
 					if ctx.Err() == nil {
-						s.updateSessionMessages(ctx, session, s.getSessionMessagesAsSlice(session), reference)
+						s.updateSessionMessages(ctx, session, s.getSessionMessagesAsSlice(session), material.reference)
 					}
 				}
-			}
-			if legacy {
-				if result.Final {
-					if strings.Contains(result.Answer, "**ERROR**") {
-						ans := s.structureAnswer(session, result.Answer, messageID, sessionID, reference)
-						if chatID != "" {
-							ans["chat_id"] = chatID
-						}
-						sendOrCancel(fmt.Sprintf("data:%s\n\n", sseMarshalChunk(sanitizeJSONFloats(ans).(map[string]interface{}), chatID)))
-					}
-					// Turn compaction: progressive persistence has been
-					// writing every delta into the assistant message. The
-					// next turn re-enters AsyncChat with this session as its
-					// history, so the stored message must end up holding the
-					// turn's final answer alone.
-					s.compactSessionAssistant(session, result.Answer, messageID)
-					finalLegacyAnswer = s.structureAnswer(session, result.Answer, messageID, sessionID, reference)
-					continue
-				}
-				if result.StartToThink {
-					fullAnswer.WriteString("<think>")
-				} else if result.EndToThink {
-					fullAnswer.WriteString("</think>")
-				}
-				if result.Reasoning != "" {
-					// Same as the non-legacy branch: there is no reasoning
-					// channel in this protocol, so thinking rides in `answer`
-					// between the start/end flags.
-					fullAnswer.WriteString(result.Reasoning)
-				}
-				if result.Answer != "" {
-					// Marker and text can arrive together (see the note in the
-					// non-legacy branch): never trade one for the other.
-					fullAnswer.WriteString(result.Answer)
-				}
-				if session != nil {
-					s.appendAssistantToSession(session, fullAnswer.String(), messageID)
-				}
-				ans := s.structureAnswer(session, fullAnswer.String(), messageID, sessionID, reference)
-				ans["start_to_think"] = nil
-				ans["end_to_think"] = nil
-				delete(ans, "start_to_think")
-				delete(ans, "end_to_think")
-				// Same structured step channel as the non-legacy path.
-				if result.ThinkEvent != nil {
-					ans["think_event"] = result.ThinkEvent
-				}
-				if chatID != "" {
-					ans["chat_id"] = chatID
-				}
-				sendOrCancel(fmt.Sprintf("data:%s\n\n", sseMarshalChunk(sanitizeJSONFloats(ans).(map[string]interface{}), chatID)))
-			} else {
-				if result.Final {
-					// Turn compaction, same as the legacy branch: progressive
-					// persistence wrote every delta into the assistant
-					// message. The next user input re-enters AsyncChat with
-					// this session as history, so the stored message must
-					// hold the final answer alone.
-					s.compactSessionAssistant(session, result.Answer, messageID)
-					if strings.Contains(result.Answer, "**ERROR**") {
-						ans := s.structureAnswer(session, result.Answer, messageID, sessionID, reference)
-						if chatID != "" {
-							ans["chat_id"] = chatID
-						}
-						sendOrCancel(fmt.Sprintf("data:%s\n\n", sseMarshalChunk(sanitizeJSONFloats(ans).(map[string]interface{}), chatID)))
-					} else {
-						ans := s.structureAnswer(session, result.Answer, messageID, sessionID, reference)
-						if result.Reference != nil {
-							ans["reference"] = result.Reference
-						}
-						ans["audio_binary"] = result.AudioBinary
-						ans["prompt"] = result.Prompt
-						if result.CreatedAt != 0 {
-							ans["created_at"] = result.CreatedAt
-						}
-						ans["final"] = true
-						if chatID != "" {
-							ans["chat_id"] = chatID
-						}
-						sendOrCancel(fmt.Sprintf("data:%s\n\n", sseMarshalChunk(sanitizeJSONFloats(ans).(map[string]interface{}), chatID)))
-					}
-					continue
-				}
-				deltaAnswer := ""
-				if result.StartToThink {
-					fullAnswer.WriteString("<think>")
-					deltaAnswer = "<think>"
-				} else if result.EndToThink {
-					fullAnswer.WriteString("</think>")
-					deltaAnswer = "</think>"
-				}
-				if result.Reasoning != "" {
-					// The native protocol has NO reasoning channel: the UI
-					// rebuilds the whole assistant message from `answer`
-					// alone, wrapping the stretch between start_to_think and
-					// end_to_think in <think>. Reasoning must therefore
-					// travel in `answer` too — dropping it here is what left
-					// the think panel empty while the run was in progress.
-					fullAnswer.WriteString(result.Reasoning)
-					deltaAnswer += result.Reasoning
-				}
-				if result.Answer != "" {
-					// A marker and the text it delimits can ride on the SAME
-					// result: the first content delta after a think block is
-					// the EndToThink result. Treating the marker as an
-					// alternative to the text drops that delta, which is how an
-					// answer came out starting mid-sentence.
-					fullAnswer.WriteString(result.Answer)
-					deltaAnswer += result.Answer
-				}
-				if session != nil {
-					s.appendAssistantToSession(session, fullAnswer.String(), messageID)
-				}
-				ans := s.structureAnswer(session, deltaAnswer, messageID, sessionID, reference)
-				// Citations ship ONLY on the final event: the intermediate
-				// deltas have nothing to cite yet, and an empty
-				// `reference: {chunks: []}` on every chunk just buries the
-				// real payload.
-				delete(ans, "reference")
-				ans["start_to_think"] = result.StartToThink
-				ans["end_to_think"] = result.EndToThink
-				// The structured twin of a reasoning step rides the chunk that
-				// carries it. An event-only chunk (no delta) is a no-op for a
-				// client that only reads answer/think markers, and gives a
-				// step-rendering client the fields the sentence cannot convey
-				// (tool, status, sources, duration).
-				if result.ThinkEvent != nil {
-					ans["think_event"] = result.ThinkEvent
-				}
-				if chatID != "" {
-					ans["chat_id"] = chatID
-				}
-				sendOrCancel(fmt.Sprintf("data:%s\n\n", sseMarshalChunk(sanitizeJSONFloats(ans).(map[string]interface{}), chatID)))
-			}
-		}
-		if legacy && finalLegacyAnswer != nil {
-			finalLegacyAnswer["answer"] = fullAnswer.String()
-			delete(finalLegacyAnswer, "start_to_think")
-			delete(finalLegacyAnswer, "end_to_think")
-			finalChunk := sseWrapper{Code: 0, Message: "", Data: sanitizeJSONFloats(finalLegacyAnswer)}
-			sendOrCancel(fmt.Sprintf("data:%s\n\n", marshalJSONWithSpaces(finalChunk)))
-		}
+				// Keep the in-memory snapshot aligned with the final pipeline
+				// answer. Persistence above intentionally retains the raw
+				// streamed answer used by the current Native contract.
+				s.compactSessionAssistant(session, material.finalAnswer, messageID)
 
-		wrapper := sseWrapper{Code: 0, Message: "", Data: true}
-		sendOrCancel(fmt.Sprintf("data:%s\n\n", marshalJSONWithSpaces(wrapper)))
+				if !sendNativeChatFrames(ctx, streamChan, translation.frames) ||
+					!sendNativeChatFrame(ctx, streamChan, nativeChatDoneFrame()) {
+					drainNativeChatResults(resultChan)
+					return nil, nil
+				}
+				drainNativeChatResults(resultChan)
+				return nil, nil
+			}
+		}
 	} else {
 		ans := accumulateNonStreamAnswer(resultChan)
 		if session != nil {
@@ -1949,19 +1827,6 @@ func (s *ChatSessionService) getSessionMessagesAsSlice(session *entity.ChatSessi
 	return parseMessages(session.Message)
 }
 
-// sendSSEError sends an error in SSE format through the stream channel.
-func (s *ChatSessionService) sendSSEError(streamChan chan<- string, errMsg string) {
-	wrapper := sseWrapper{
-		Code:    500,
-		Message: errMsg,
-		Data: map[string]interface{}{
-			"answer":    "**ERROR**: " + errMsg,
-			"reference": []interface{}{},
-		},
-	}
-	streamChan <- fmt.Sprintf("data:%s\n\n", marshalJSONWithSpaces(wrapper))
-}
-
 // Helper methods
 
 func (s *ChatSessionService) initializeReference(session *entity.ChatSession) []interface{} {
@@ -2009,71 +1874,6 @@ func (s *ChatSessionService) checkTenantLLMAPIKey(ctx context.Context, tenantID,
 	return true, nil
 }
 
-// sseAnswerChunk has deterministic JSON field order matching Python's structure_answer output.
-type sseAnswerChunk struct {
-	Answer string `json:"answer"`
-	// Reference is omitted from the JSON when the producer did not set one:
-	// intermediate streaming deltas have nothing to cite yet, and only the
-	// final event carries the citation payload (set explicitly by the
-	// pipeline's Final branch). sseMarshalChunk leaves it nil in that case.
-	Reference    map[string]interface{} `json:"reference,omitempty"`
-	AudioBinary  interface{}            `json:"audio_binary"`
-	Prompt       string                 `json:"prompt"`
-	CreatedAt    float64                `json:"created_at"`
-	Final        bool                   `json:"final"`
-	ID           string                 `json:"id"`
-	SessionID    string                 `json:"session_id"`
-	ChatID       string                 `json:"chat_id,omitempty"`
-	StartToThink bool                   `json:"start_to_think,omitempty"`
-	EndToThink   bool                   `json:"end_to_think,omitempty"`
-	ThinkEvent   interface{}            `json:"think_event,omitempty"`
-}
-
-// sseWrapper wraps the SSE response with deterministic field order matching Python:
-//
-//	{"code": 0, "message": "", "data": ...}
-type sseWrapper struct {
-	Code    int         `json:"code"`
-	Message string      `json:"message"`
-	Data    interface{} `json:"data"`
-}
-
-// marshalJSONWithSpaces marshals v to JSON and adds spaces after ':' and ','
-// to match Python's json.dumps format.
-func marshalJSONWithSpaces(v interface{}) string {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return "{}"
-	}
-	return addJSONSpacesOutsideStrings(data)
-}
-
-func addJSONSpacesOutsideStrings(data []byte) string {
-	var b strings.Builder
-	b.Grow(len(data) + 16)
-	inString := false
-	escaped := false
-	for _, c := range data {
-		b.WriteByte(c)
-		if escaped {
-			escaped = false
-			continue
-		}
-		if inString && c == '\\' {
-			escaped = true
-			continue
-		}
-		if c == '"' {
-			inString = !inString
-			continue
-		}
-		if !inString && (c == ':' || c == ',') {
-			b.WriteByte(' ')
-		}
-	}
-	return b.String()
-}
-
 // sanitizeJSONFloats recursively replaces NaN/Infinity with nil.
 // Matches Python's _sanitize_json_floats in chat_api.py.
 func sanitizeJSONFloats(v interface{}) interface{} {
@@ -2109,77 +1909,6 @@ func sanitizeJSONFloats(v interface{}) interface{} {
 		return out
 	default:
 		return v
-	}
-}
-
-// sseMarshalChunk converts an answer map to the ordered sseAnswerChunk struct
-// and marshals it with Python-compatible JSON formatting (spaces, field order).
-func sseMarshalChunk(ans map[string]interface{}, chatID string) string {
-	// Reference is emitted only when the producer set one: the delta branch
-	// deletes the key so intermediate chunks stay reference-free, and silently
-	// re-adding an empty `{"chunks": []}` here would undo that — every
-	// intermediate chunk would carry a citation payload it cannot back.
-	ref := map[string]interface{}{"chunks": []interface{}{}}
-	if raw, hasRef := ans["reference"]; hasRef {
-		if m, ok := raw.(map[string]interface{}); ok && m != nil {
-			ref = m
-		}
-	} else {
-		ref = nil // key absent → omit from the JSON entirely (omitempty)
-	}
-	answer, _ := ans["answer"].(string)
-	prompt, _ := ans["prompt"].(string)
-	id, _ := ans["id"].(string)
-	sessionID, _ := ans["session_id"].(string)
-	createdAt, _ := ans["created_at"].(float64)
-	final, _ := ans["final"].(bool)
-
-	startToThink, _ := ans["start_to_think"].(bool)
-	endToThink, _ := ans["end_to_think"].(bool)
-
-	chunk := sseAnswerChunk{
-		Answer:       answer,
-		Reference:    ref,
-		AudioBinary:  ans["audio_binary"],
-		Prompt:       prompt,
-		CreatedAt:    createdAt,
-		Final:        final,
-		ID:           id,
-		SessionID:    sessionID,
-		ChatID:       chatID,
-		StartToThink: startToThink,
-		EndToThink:   endToThink,
-		ThinkEvent:   ans["think_event"],
-	}
-	wrapper := sseWrapper{Code: 0, Message: "", Data: chunk}
-	return marshalJSONWithSpaces(wrapper)
-}
-
-func (s *ChatSessionService) structureAnswer(session *entity.ChatSession, answer string, messageID, conversationID string, reference []interface{}) map[string]interface{} {
-	// Match Python's structure_answer output:
-	// {"answer", "reference": {"chunks": [...]}, "audio_binary": null, "prompt": "",
-	//  "created_at": ..., "final": false, "id": "...", "session_id": "..."}
-	refMap := map[string]interface{}{
-		"chunks":   []interface{}{},
-		"doc_aggs": []interface{}{},
-	}
-	if len(reference) > 0 {
-		if latest, ok := reference[len(reference)-1].(map[string]interface{}); ok && latest != nil {
-			refMap = latest
-			if _, ok := refMap["chunks"]; !ok {
-				refMap["chunks"] = []interface{}{}
-			}
-		}
-	}
-	return map[string]interface{}{
-		"answer":       answer,
-		"reference":    refMap,
-		"audio_binary": nil,
-		"prompt":       "",
-		"created_at":   float64(time.Now().UnixNano()) / 1e9,
-		"final":        false,
-		"id":           messageID,
-		"session_id":   conversationID,
 	}
 }
 

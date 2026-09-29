@@ -17,6 +17,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +35,7 @@ import (
 // ChatSessionHandler chat session (conversation) handler
 type ChatSessionHandler struct {
 	chatSessionService *service.ChatSessionService
+	chatCompleter      chatCompleter
 	userService        *service.UserService
 }
 
@@ -41,6 +43,7 @@ type ChatSessionHandler struct {
 func NewChatSessionHandler(chatSessionService *service.ChatSessionService, userService *service.UserService) *ChatSessionHandler {
 	return &ChatSessionHandler{
 		chatSessionService: chatSessionService,
+		chatCompleter:      chatSessionService,
 		userService:        userService,
 	}
 }
@@ -253,11 +256,14 @@ func (h *ChatSessionHandler) ChatCompletions(c *gin.Context) {
 		c.Header("Connection", "keep-alive")
 		c.Header("X-Accel-Buffering", "no")
 
-		streamChan := make(chan string, 32)
-		reqCtx := c.Request.Context()
+		reqCtx, cancel := context.WithCancel(c.Request.Context())
+		defer cancel()
+		streamChan := make(chan service.NativeChatFrame)
+		producerDone := make(chan struct{})
 		go func() {
 			defer close(streamChan)
-			_, _ = h.chatSessionService.ChatCompletions(
+			defer close(producerDone)
+			_, _ = h.chatCompleter.ChatCompletions(
 				reqCtx, userID,
 				req.ChatID, sessionID,
 				req.Messages, req.Question, req.Files,
@@ -267,14 +273,14 @@ func (h *ChatSessionHandler) ChatCompletions(c *gin.Context) {
 			)
 		}()
 
-		c.Stream(func(w io.Writer) bool {
-			data, ok := <-streamChan
-			if !ok {
-				return false
+		if writeErr := writeNativeChatStream(reqCtx, c.Writer, streamChan); writeErr != nil {
+			cancel()
+			if !errors.Is(writeErr, context.Canceled) {
+				logNativeChatStreamError(writeErr)
 			}
-			c.Writer.Write([]byte(data))
-			return true
-		})
+		}
+		cancel()
+		<-producerDone
 	} else {
 		// The non-stream path computes the whole answer before its first
 		// (and only) write. Agentic runs can take minutes — well past the
@@ -284,7 +290,7 @@ func (h *ChatSessionHandler) ChatCompletions(c *gin.Context) {
 		// "write tcp ... i/o timeout" after a long agent run.
 		clearResponseWriteDeadline(c)
 		var result map[string]interface{}
-		result, err = h.chatSessionService.ChatCompletions(
+		result, err = h.chatCompleter.ChatCompletions(
 			c.Request.Context(), userID,
 			req.ChatID, sessionID,
 			req.Messages, req.Question, req.Files,

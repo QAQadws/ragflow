@@ -982,7 +982,7 @@ func TestChatCompletions_AppendOnly(t *testing.T) {
 							AsyncChatResult{Answer: "test answer", Reference: ref, Final: true},
 						)}
 						svc := &ChatSessionService{chatSessionDAO: store, userTenantDAO: &fakeTenantStore{}, pipeline: pipeline}
-						streamChan := make(chan string, 8)
+						streamChan := make(chan NativeChatFrame, 8)
 						result, err := svc.ChatCompletions(t.Context(), "user-1", "dialog-1", sessionID, payload, "must not replace payload", nil, "", nil, map[string]interface{}{"store_history_messages": false}, legacy, stream, streamChan)
 						if err != nil {
 							t.Errorf("completion failed: %v", err)
@@ -997,7 +997,12 @@ func TestChatCompletions_AppendOnly(t *testing.T) {
 						if stream {
 							foundReference := false
 							for len(streamChan) > 0 {
-								foundReference = strings.Contains(<-streamChan, "test chunk") || foundReference
+								encoded, marshalErr := json.Marshal((<-streamChan).Data)
+								if marshalErr != nil {
+									t.Errorf("marshal stream frame: %v", marshalErr)
+									break
+								}
+								foundReference = strings.Contains(string(encoded), "test chunk") || foundReference
 							}
 							if !foundReference {
 								t.Error("stream lost reference")
@@ -1132,7 +1137,7 @@ func TestChatCompletionsStreamFinalCarriesDecoratedReference(t *testing.T) {
 		pipeline:       pipeline,
 	}
 
-	streamChan := make(chan string, 8)
+	streamChan := make(chan NativeChatFrame, 8)
 	_, err := svc.ChatCompletions(
 		t.Context(),
 		"user-1",
@@ -1155,14 +1160,13 @@ func TestChatCompletionsStreamFinalCarriesDecoratedReference(t *testing.T) {
 	var finalData map[string]interface{}
 	eventCount := len(streamChan)
 	for i := 0; i < eventCount; i++ {
-		event := <-streamChan
-		payload := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(event), "data:"))
-		var wrapper map[string]interface{}
-		if err := json.Unmarshal([]byte(payload), &wrapper); err != nil {
-			t.Fatalf("failed to parse SSE payload %q: %v", payload, err)
+		frame := <-streamChan
+		encoded, err := json.Marshal(frame.Data)
+		if err != nil {
+			t.Fatalf("marshal stream data: %v", err)
 		}
-		data, ok := wrapper["data"].(map[string]interface{})
-		if !ok {
+		var data map[string]interface{}
+		if err := json.Unmarshal(encoded, &data); err != nil {
 			continue
 		}
 		if final, _ := data["final"].(bool); final {
